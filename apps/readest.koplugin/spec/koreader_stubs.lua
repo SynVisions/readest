@@ -114,6 +114,8 @@ function M.reset()
         for i = #list, 1, -1 do list[i] = nil end
     end
     M.util.partialMD5 = function(_file) return "stub-md5" end
+    M.NetworkMgr._online = true
+    M.NetworkMgr._willRerunWhenOnline_calls = 0
     M.LibraryWidget._menu = nil
     M.LibraryWidget._store = nil
     M.LibraryWidget._current_user = nil
@@ -148,12 +150,19 @@ package.preload["ui/widget/container/widgetcontainer"] = function()
         end,
     }
 end
-package.preload["ui/network/manager"] = function()
-    return {
-        willRerunWhenOnline = function() return false end,
-        goOnlineToRun = function(_, cb) cb() end,
-    }
-end
+-- Hoisted so specs can flip connectivity (M.NetworkMgr._online) and
+-- observe which NetworkMgr path a call took.
+M.NetworkMgr = {
+    _online = true,
+    _willRerunWhenOnline_calls = 0,
+    isOnline = function(self) return self._online end,
+    willRerunWhenOnline = function(self)
+        self._willRerunWhenOnline_calls = self._willRerunWhenOnline_calls + 1
+        return false
+    end,
+    goOnlineToRun = function(_, cb) cb() end,
+}
+package.preload["ui/network/manager"] = function() return M.NetworkMgr end
 package.preload["ffi/sha2"] = function()
     return {
         base64_to_bin = function(s) return s end,

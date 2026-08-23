@@ -278,6 +278,12 @@ msgstr "Keluar sebagai %1"
 msgid "Auto sync"
 msgstr "Sinkronisasi otomatis"
 
+msgid "Auto sync only when already online"
+msgstr ""
+
+msgid "When enabled, the automatic sync on book open and on wake runs only if the device is already online. It never turns Wi-Fi on or asks to; it waits and syncs once a connection comes back. Leave disabled to follow KOReader's \"Action when Wi-Fi is off\" setting instead."
+msgstr ""
+
 msgid "Readest library"
 msgstr "Pustaka Readest"
 

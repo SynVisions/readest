@@ -32,6 +32,7 @@ ReadestSync.default_settings = {
     supabase_url = "https://readest.supabase.co",
     supabase_anon_key = sha2.base64_to_bin(SUPABAE_ANON_KEY_BASE64),
     auto_sync = false,
+    auto_sync_online_only = false,
     user_email = nil,
     user_name = nil,
     user_id = nil,
@@ -544,6 +545,16 @@ function ReadestSync:addToMainMenu(menu_items)
                 callback = function()
                     self:onReadestSyncToggleAutoSync()
                 end,
+            },
+            {
+                text = _("Auto sync only when already online"),
+                help_text = _("When enabled, the automatic sync on book open and on wake runs only if the device is already online. It never turns Wi-Fi on or asks to; it waits and syncs once a connection comes back. Leave disabled to follow KOReader's \"Action when Wi-Fi is off\" setting instead."),
+                checked_func = function() return self.settings.auto_sync_online_only end,
+                enabled_func = function() return self.settings.auto_sync end,
+                callback = function()
+                    self.settings.auto_sync_online_only = not self.settings.auto_sync_online_only
+                    G_reader_settings:saveSetting("readest_sync", self.settings)
+                end,
                 separator = true,
             },
             {
@@ -769,6 +780,38 @@ function ReadestSync:showSyncInfo()
     })
 end
 
+-- Gate a pull on connectivity.
+--
+-- Default: NetworkMgr:willRerunWhenOnline, which, when offline, brings
+-- Wi-Fi up per the user's "Action when Wi-Fi is off" setting and reruns
+-- the call once connected. Interactive pulls (menu tap / gesture) always
+-- take this path.
+--
+-- With "Auto sync only when already online" enabled, a background pull
+-- (auto sync on book open / device wake) instead checks isOnline() and,
+-- when offline, skips silently, remembers that it skipped, and lets
+-- onNetworkConnected rerun it once the device is back online (e.g. after
+-- KOReader's own silent "Restore Wi-Fi connection on resume"). This is for
+-- devices where KOReader drives the radio itself (Kobo, Kindle, …): there
+-- NetworkMgr:beforeWifiAction is modal and blocks the UI thread — with
+-- "turn on" it shows a "Connecting to Wi-Fi…" / "Scanning for networks…"
+-- dialog with no cancel path that runs ~30 s when no known access point is
+-- in range; with "prompt" it asks on every wake. Users who travel with the
+-- reader asked for a way out of that (#4113, #2137).
+--
+-- Returns true when the caller must stop (offline), false to proceed.
+function ReadestSync:willRerunPullWhenOnline(interactive, callback)
+    if interactive or not self.settings.auto_sync_online_only then
+        return NetworkMgr:willRerunWhenOnline(callback)
+    end
+    if NetworkMgr:isOnline() then
+        return false
+    end
+    logger.dbg("ReadestSync: offline; skipping background sync, will retry on NetworkConnected")
+    self.pull_pending_offline = true
+    return true
+end
+
 -- ── Config sync ────────────────────────────────────────────────────
 
 function ReadestSync:pushBookConfig(interactive)
@@ -793,7 +836,7 @@ function ReadestSync:pullBookConfig(interactive)
     local book_hash, meta_hash = self:getBookIdentifiers()
     if not book_hash or not meta_hash then return end
 
-    if NetworkMgr:willRerunWhenOnline(function() self:pullBookConfig(interactive) end) then
+    if self:willRerunPullWhenOnline(interactive, function() self:pullBookConfig(interactive) end) then
         return
     end
 
@@ -823,7 +866,7 @@ end
 
 function ReadestSync:pullBookStats(interactive)
     logger.dbg("ReadestStats pullBookStats: triggered, interactive=" .. tostring(interactive))
-    if NetworkMgr:willRerunWhenOnline(function() self:pullBookStats(interactive) end) then
+    if self:willRerunPullWhenOnline(interactive, function() self:pullBookStats(interactive) end) then
         return
     end
     local client = self:ensureClient(interactive)
@@ -852,7 +895,7 @@ function ReadestSync:pullBookNotes(interactive, full_sync)
     local book_hash, meta_hash = self:getBookIdentifiers()
     if not book_hash or not meta_hash then return end
 
-    if NetworkMgr:willRerunWhenOnline(function() self:pullBookNotes(interactive, full_sync) end) then
+    if self:willRerunPullWhenOnline(interactive, function() self:pullBookNotes(interactive, full_sync) end) then
         return
     end
 
@@ -1139,6 +1182,25 @@ function ReadestSync:onNetworkConnected()
     if self.settings.localsend_enabled then
         self.localsend:startService()
     end
+    -- A background pull (open / wake) was skipped while offline — see
+    -- willRerunPullWhenOnline. Now that the device is online, run it. Same
+    -- short defer as onReaderReady: let the event settle before the
+    -- round-trips, and keep a handle so a book close cancels it.
+    if not self.pull_pending_offline then return end
+    if not (self.settings.auto_sync and self.settings.access_token and self.ui and self.ui.document) then
+        return
+    end
+    self.pull_pending_offline = nil
+    if self.network_pull_task then
+        UIManager:unschedule(self.network_pull_task)
+    end
+    self.network_pull_task = function()
+        self.network_pull_task = nil
+        self:pullBookConfig(false)
+        self:pullBookNotes(false)
+        self:pullBookStats(false)
+    end
+    UIManager:scheduleIn(READER_READY_PULL_DELAY, self.network_pull_task)
 end
 
 function ReadestSync:onNetworkDisconnected()
@@ -1162,6 +1224,13 @@ function ReadestSync:onCloseWidget()
         UIManager:unschedule(self.reader_ready_pull_task)
         self.reader_ready_pull_task = nil
     end
+    if self.network_pull_task then
+        UIManager:unschedule(self.network_pull_task)
+        self.network_pull_task = nil
+    end
+    -- A skipped pull belongs to the document that was open at the time; the
+    -- next open pulls on its own, so don't carry the flag across books.
+    self.pull_pending_offline = nil
     -- The LocalSend poll belongs to the singleton service, not to this
     -- plugin instance, and its closure captures the singleton (which
     -- survives context switches). Tearing it down here raced the next
